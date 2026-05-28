@@ -20,9 +20,9 @@ from typing import List, Dict, Tuple, Optional, Set, Union
 
 PRINT_LOCK = threading.Lock()
 PORT_LOCK = threading.Lock()
-START_PORT = 30000  # پورت پایه برای اجرای همزمان Xray
+START_PORT = 30000  # پورت پایه برای جلوگیری از تداخل اجرای همزمان Xray
 OUTPUT_DIR = "data"
-XRAY_PATH = "./xray" # مسیر فایل باینری xray
+XRAY_PATH = "./xray"  # مسیر فایل باینری xray (در ویندوز به ./xray.exe تغییر دهید)
 
 CONFIG_URLS: List[str] = [
     "https://raw.githubusercontent.com/itsyebekhe/PSG/main/subscriptions/xray/base64/mix",
@@ -68,15 +68,15 @@ CONFIG_URLS: List[str] = [
 # نام پایه فایل خروجی (بدون پسوند)
 OUTPUT_BASENAME: str = os.getenv("REALITY_OUTPUT_FILENAME", "khanevadeh")
 
-# تنظیمات تست
+# تنظیمات زمانی و فیلترینگ تست‌ها
 REQUEST_TIMEOUT: int = 15
 TCP_CONNECT_TIMEOUT: int = 4
 NUM_TCP_TESTS: int = 5
 MIN_SUCCESSFUL_TESTS_RATIO: float = 0.6
 MAX_CONFIGS_TO_TEST: int = 90000
-MAX_CONFIGS_FOR_XRAY: int = 2000 # حداکثر تعداد کانفیگی که به هسته Xray فرستاده می‌شود
+MAX_CONFIGS_FOR_XRAY: int = 2000  # حداکثر تعداد کانفیگی که وارد فاز تست عمیق با هسته Xray می‌شود
 FINAL_MAX_OUTPUT_CONFIGS: int = 1000000
-CHUNK_SIZE: int = 1000 # تعداد کانفیگ در هر فایل
+CHUNK_SIZE: int = 1000  # تعداد کانفیگ در هر فایل خروجی
 
 SEEN_IDENTIFIERS: Set[Tuple[str, int, str]] = set()
 USER_AGENTS = [
@@ -143,7 +143,7 @@ def parse_vless_config(config_str: str) -> Optional[Dict[str, Union[str, int]]]:
             "sni": query_params.get('sni', [''])[0],
             "sid": query_params.get('sid', [''])[0],
             "spx": query_params.get('spx', [''])[0],
-            "flow": query_params.get('flow', [''])[0], # افزوده شد برای Xray
+            "flow": query_params.get('flow', [''])[0],
             "name": urllib.parse.unquote(parsed.fragment) if parsed.fragment else "",
             "original_config": config_str
         }
@@ -291,9 +291,9 @@ def measure_quality_metrics(config: Dict) -> Optional[Dict]:
     return config
 
 def evaluate_configs(configs: List[Dict]) -> List[Dict]:
-    # --- مرحله اول: فیلتر اولیه شبکه با TCP ---
+    # --- مرحله اول: فیلتر اولیه شبکه‌ای با لایه TCP ---
     target_configs = configs[:MAX_CONFIGS_TO_TEST]
-    safe_print(f"\n🔍 مرحله ۲/۳: تست اولیه (Ping & Jitter) روی {len(target_configs)} کانفیگ...")
+    safe_print(f"\n🔍 مرحله ۲/۳: تست اولیه شبکه (Ping & Jitter) روی {len(target_configs)} کانفیگ ورودی...")
     
     tcp_alive = []
     total_tcp = len(target_configs)
@@ -309,12 +309,12 @@ def evaluate_configs(configs: List[Dict]) -> List[Dict]:
 
     tcp_alive.sort(key=lambda x: (x['jitter_ms'], x['latency_ms']))
     
-    # --- مرحله دوم: تست عمیق با هسته Xray ---
+    # --- مرحله دوم: اعتبارسنجی اتصال و تست عمیق پینگ با هسته Xray ---
     xray_targets = tcp_alive[:MAX_CONFIGS_FOR_XRAY]
     if not xray_targets:
         return []
         
-    safe_print(f"\n🛡️ مرحله ۳/۳: تست عمیق اعتبارسنجی با Xray روی {len(xray_targets)} کانفیگ زنده...")
+    safe_print(f"\n🛡️ مرحله ۳/۳: تست عمیق اعتبارسنجی با Xray روی {len(xray_targets)} سرور زنده لایه اول...")
     xray_verified = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, os.cpu_count() * 3)) as executor:
         futures = {executor.submit(validate_with_xray, cfg): cfg for cfg in xray_targets}
@@ -324,7 +324,7 @@ def evaluate_configs(configs: List[Dict]) -> List[Dict]:
             if (i + 1) % 10 == 0 or (i + 1) == len(xray_targets):
                 print_progress(i + 1, len(xray_targets), prefix='تست Xray:', suffix='تکمیل')
 
-    # مرتب‌سازی نهایی بر اساس پینگ واقعی که از هسته Xray گرفته شده است
+    # مرتب‌سازی نهایی بر اساس پینگ واقعی داخل تونل Xray
     xray_verified.sort(key=lambda x: x.get('real_latency', 9999))
     return xray_verified
 
@@ -347,7 +347,7 @@ def save_results(configs: List[Dict]) -> None:
         for i, cfg in enumerate(chunk):
             global_index = chunk_start + i + 1 
             clean_link = cfg['original_config'].split('#')[0]
-            # از real_latency که خروجی تست دقیق Xray است استفاده می‌کنیم
+            # استفاده از real_latency به جای تست پینگ خام TCP
             output_lines.append(f"{clean_link}#Config_{global_index}_Ping-{int(cfg.get('real_latency', 0))}")
             
         base64_str = base64.b64encode("\n".join(output_lines).encode('utf-8')).decode('utf-8')
@@ -360,18 +360,19 @@ def save_results(configs: List[Dict]) -> None:
         safe_print(f"\n💾 ذخیره شد: {path} | تعداد: {len(chunk)}")
         total_saved += len(chunk)
         
-    safe_print(f"\n✅ در مجموع {total_saved} کانفیگ در {file_count} فایل مجزا ذخیره شد.")
+    safe_print(f"\n✅ در مجموع {total_saved} کانفیگ سالم در {file_count} فایل مجزا ذخیره شد.")
 
 def main():
+    # بررسی الزامی وجود فایل اجرایی هسته Xray در مسیر مشخص‌شده
     if not os.path.exists(XRAY_PATH):
-        safe_print("❌ هسته Xray یافت نشد. لطفاً فایل xray را در کنار اسکریپت قرار دهید.")
+        safe_print("❌ هسته Xray یافت نشد. لطفاً ابتدا فایل xray را در کنار اسکریپت قرار دهید.")
         sys.exit(1)
 
     start = time.time()
     all_configs = gather_configurations(CONFIG_URLS)
     ranked_configs = evaluate_configs(all_configs)
     save_results(ranked_configs)
-    safe_print(f"\n⏱️ زمان کل پردازش: {time.time() - start:.2f} ثانیه")
+    safe_print(f"\n⏱️ زمان کل پردازش اسکریپت: {time.time() - start:.2f} ثانیه")
 
 if __name__ == "__main__":
     main()
