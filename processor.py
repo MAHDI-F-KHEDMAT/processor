@@ -22,7 +22,7 @@ PRINT_LOCK = threading.Lock()
 PORT_LOCK = threading.Lock()
 START_PORT = 30000  # پورت پایه برای جلوگیری از تداخل اجرای همزمان Xray
 OUTPUT_DIR = "data"
-XRAY_PATH = "./xray"  # مسیر فایل باینری xray (در ویندوز به ./xray.exe تغییر دهید)
+XRAY_PATH = "./xray"  # مسیر فایل باینری xray در لینوکس گیت‌هاب اکشنز
 
 CONFIG_URLS: List[str] = [
     "https://raw.githubusercontent.com/itsyebekhe/PSG/main/subscriptions/xray/base64/mix",
@@ -69,14 +69,14 @@ CONFIG_URLS: List[str] = [
 OUTPUT_BASENAME: str = os.getenv("REALITY_OUTPUT_FILENAME", "khanevadeh")
 
 # تنظیمات زمانی و فیلترینگ تست‌ها
-REQUEST_TIMEOUT: int = 15
-TCP_CONNECT_TIMEOUT: int = 4
+REQUEST_TIMEOUT: int = 8
+TCP_CONNECT_TIMEOUT: int = 3
 NUM_TCP_TESTS: int = 5
-MIN_SUCCESSFUL_TESTS_RATIO: float = 0.6
-MAX_CONFIGS_TO_TEST: int = 90000
-MAX_CONFIGS_FOR_XRAY: int = 2000  # حداکثر تعداد کانفیگی که وارد فاز تست عمیق با هسته Xray می‌شود
+MIN_SUCCESSFUL_TESTS_RATIO: float = 0.6  # 3 موفقیت از 5 تست کافی است
+MAX_CONFIGS_TO_TEST: int = 150000
+MAX_CONFIGS_FOR_XRAY: int = 5000  # اجازه ورود تعداد بیشتری به فاز نهایی در سرور گیت‌هاب
 FINAL_MAX_OUTPUT_CONFIGS: int = 1000000
-CHUNK_SIZE: int = 1000  # تعداد کانفیگ در هر فایل خروجی
+CHUNK_SIZE: int = 1000
 
 SEEN_IDENTIFIERS: Set[Tuple[str, int, str]] = set()
 USER_AGENTS = [
@@ -199,19 +199,30 @@ def build_xray_config(config: Dict, local_port: int) -> Dict:
 def validate_with_xray(config: Dict) -> Optional[Dict]:
     local_port = get_free_port()
     config_file_path = f"temp_cfg_{threading.get_ident()}_{local_port}.json"
-    with open(config_file_path, 'w') as f: 
+    with open(config_file_path, 'w') as f:
         json.dump(build_xray_config(config, local_port), f)
 
     proc = None  
     try:  
         proc = subprocess.Popen([XRAY_PATH, "-c", config_file_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  
-        time.sleep(1.5)  
+        time.sleep(1.0)  # در سرور گیت‌هاب ۱ ثانیه برای لود شدن هسته کافیست
+        
         proxies = {"http": f"http://127.0.0.1:{local_port}", "https": f"http://127.0.0.1:{local_port}"}  
+        
         start = time.perf_counter()  
-        response = requests.get("http://cp.cloudflare.com/generate_204", proxies=proxies, timeout=10.0)  
-        if response.status_code == 204:  
+        response1 = requests.get("http://cp.cloudflare.com/generate_204", proxies=proxies, timeout=4.0)  
+        
+        if response1.status_code != 204:
+            return None
+
+        # تست پایداری
+        time.sleep(0.5) 
+        response2 = requests.get("https://www.google.com/generate_204", proxies=proxies, timeout=5.0)
+        
+        if response2.status_code == 204:  
             config['real_latency'] = (time.perf_counter() - start) * 1000  
             return config  
+            
     except Exception: 
         pass  
     finally:  
@@ -221,6 +232,7 @@ def validate_with_xray(config: Dict) -> Optional[Dict]:
         if os.path.exists(config_file_path):   
             try: os.remove(config_file_path)  
             except OSError: pass  
+            
     return None
 
 # --- Core Logic ---
@@ -258,7 +270,8 @@ def gather_configurations(links: List[str]) -> List[Dict]:
     safe_print("🚀 مرحله ۱/۳: در حال دریافت و پردازش کانفیگ‌های Reality...")
     all_configs = []
     total_links = len(links)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+    # تنظیم ۳۰ ورکر برای دانلود سریع سورس‌ها بدون مسدود شدن آی‌پی گیت‌هاب
+    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
         futures = {executor.submit(fetch_subscription_content, url): url for url in links}
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             content = future.result()
@@ -281,7 +294,8 @@ def measure_quality_metrics(config: Dict) -> Optional[Dict]:
     for _ in range(NUM_TCP_TESTS):
         lat = test_tcp_latency(host, port, TCP_CONNECT_TIMEOUT)
         if lat: latencies.append(lat)
-        time.sleep(0.05) 
+        # مکث بین پینگ‌ها در گیت‌هاب اکشنز بسیار مهم است تا کلادفلر آی‌پی را مسدود نکند
+        time.sleep(0.1) 
         
     if not latencies or len(latencies) < (NUM_TCP_TESTS * MIN_SUCCESSFUL_TESTS_RATIO):
         return None
@@ -291,13 +305,14 @@ def measure_quality_metrics(config: Dict) -> Optional[Dict]:
     return config
 
 def evaluate_configs(configs: List[Dict]) -> List[Dict]:
-    # --- مرحله اول: فیلتر اولیه شبکه‌ای با لایه TCP ---
     target_configs = configs[:MAX_CONFIGS_TO_TEST]
     safe_print(f"\n🔍 مرحله ۲/۳: تست اولیه شبکه (Ping & Jitter) روی {len(target_configs)} کانفیگ ورودی...")
     
     tcp_alive = []
     total_tcp = len(target_configs)
-    workers = min(60, os.cpu_count() * 10)
+    
+    # تنظیم ۱۵۰ ورکر برای تست TCP که برای پردازنده ۲ هسته‌ای گیت‌هاب ایده‌آل است
+    workers = 150
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(measure_quality_metrics, cfg): cfg for cfg in target_configs}
@@ -309,14 +324,17 @@ def evaluate_configs(configs: List[Dict]) -> List[Dict]:
 
     tcp_alive.sort(key=lambda x: (x['jitter_ms'], x['latency_ms']))
     
-    # --- مرحله دوم: اعتبارسنجی اتصال و تست عمیق پینگ با هسته Xray ---
     xray_targets = tcp_alive[:MAX_CONFIGS_FOR_XRAY]
     if not xray_targets:
         return []
         
     safe_print(f"\n🛡️ مرحله ۳/۳: تست عمیق اعتبارسنجی با Xray روی {len(xray_targets)} سرور زنده لایه اول...")
     xray_verified = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, os.cpu_count() * 3)) as executor:
+    
+    # تنظیم ۴۰ ورکر برای هسته Xray. بیشتر از این مقدار باعث کرش کردن CPU گیت‌هاب اکشنز می‌شود
+    xray_workers = 40
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=xray_workers) as executor:
         futures = {executor.submit(validate_with_xray, cfg): cfg for cfg in xray_targets}
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             res = future.result()
@@ -324,13 +342,12 @@ def evaluate_configs(configs: List[Dict]) -> List[Dict]:
             if (i + 1) % 10 == 0 or (i + 1) == len(xray_targets):
                 print_progress(i + 1, len(xray_targets), prefix='تست Xray:', suffix='تکمیل')
 
-    # مرتب‌سازی نهایی بر اساس پینگ واقعی داخل تونل Xray
     xray_verified.sort(key=lambda x: x.get('real_latency', 9999))
     return xray_verified
 
 def save_results(configs: List[Dict]) -> None:
     if not configs: 
-        safe_print("\n⚠️ هیچ کانفیگی برای ذخیره یافت نشد.")
+        safe_print("\n⚠️ هیچ کانفیگ پایداری یافت نشد.")
         return
         
     top_configs = configs[:FINAL_MAX_OUTPUT_CONFIGS]
@@ -347,7 +364,6 @@ def save_results(configs: List[Dict]) -> None:
         for i, cfg in enumerate(chunk):
             global_index = chunk_start + i + 1 
             clean_link = cfg['original_config'].split('#')[0]
-            # استفاده از real_latency به جای تست پینگ خام TCP
             output_lines.append(f"{clean_link}#Config_{global_index}_Ping-{int(cfg.get('real_latency', 0))}")
             
         base64_str = base64.b64encode("\n".join(output_lines).encode('utf-8')).decode('utf-8')
@@ -360,13 +376,15 @@ def save_results(configs: List[Dict]) -> None:
         safe_print(f"\n💾 ذخیره شد: {path} | تعداد: {len(chunk)}")
         total_saved += len(chunk)
         
-    safe_print(f"\n✅ در مجموع {total_saved} کانفیگ سالم در {file_count} فایل مجزا ذخیره شد.")
+    safe_print(f"\n✅ در مجموع {total_saved} کانفیگ پایدار و سالم در {file_count} فایل مجزا ذخیره شد.")
 
 def main():
-    # بررسی الزامی وجود فایل اجرایی هسته Xray در مسیر مشخص‌شده
     if not os.path.exists(XRAY_PATH):
         safe_print("❌ هسته Xray یافت نشد. لطفاً ابتدا فایل xray را در کنار اسکریپت قرار دهید.")
         sys.exit(1)
+
+    # دادن مجوز اجرا به باینری xray در لینوکس (مخصوص گیت‌هاب اکشنز)
+    os.chmod(XRAY_PATH, 0o755)
 
     start = time.time()
     all_configs = gather_configurations(CONFIG_URLS)
