@@ -128,22 +128,31 @@ def parse_vless_config(config_str: str) -> Optional[Dict[str, Union[str, int]]]:
             return None
 
         query_params = urllib.parse.parse_qs(parsed.query)
-        if query_params.get('security', [''])[0] != 'reality':
+        security = query_params.get('security', [''])[0].lower()
+        
+        # پذیرش ریالیتی، تی‌ال‌اس و ایکس‌تی‌ال‌اس
+        if security not in ['reality', 'tls', 'xtls']:
             return None
         
-        if not query_params.get('pbk', [''])[0]:
+        # کلید عمومی فقط برای ریالیتی اجباری است
+        if security == 'reality' and not query_params.get('pbk', [''])[0]:
             return None
 
         return {
             "uuid": uuid,
             "server": server_host,
             "port": int(server_port_num),
+            "security": security,
             "pbk": query_params.get('pbk', [''])[0],
             "fp": query_params.get('fp', [''])[0],
             "sni": query_params.get('sni', [''])[0],
             "sid": query_params.get('sid', [''])[0],
             "spx": query_params.get('spx', [''])[0],
             "flow": query_params.get('flow', [''])[0],
+            "net": query_params.get('type', query_params.get('net', ['tcp']))[0].lower(),  # نوع شبکه (tcp, ws, grpc)
+            "path": query_params.get('path', [''])[0],
+            "host": query_params.get('host', [''])[0],
+            "serviceName": query_params.get('serviceName', [''])[0],
             "name": urllib.parse.unquote(parsed.fragment) if parsed.fragment else "",
             "original_config": config_str
         }
@@ -168,17 +177,37 @@ def build_xray_config(config: Dict, local_port: int) -> Dict:
     if config.get("flow"):
         user_settings["flow"] = config["flow"]
 
+    network_type = config.get("net", "tcp")
     stream_settings = {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
+        "network": network_type,
+        "security": config["security"]
+    }
+
+    # تنظیمات لایه انتقال شبکه (پشتیبانی از WebSocket و gRPC)
+    if network_type == "ws":
+        stream_settings["wsSettings"] = {
+            "path": config.get("path", ""),
+            "headers": {"Host": config.get("host", "")} if config.get("host") else {}
+        }
+    elif network_type == "grpc":
+        stream_settings["grpcSettings"] = {
+            "serviceName": config.get("serviceName", "")
+        }
+
+    # تفکیک تنظیمات امنیت بر اساس Reality یا TLS
+    if config["security"] == "reality":
+        stream_settings["realitySettings"] = {
             "serverName": config.get("sni", ""),
             "fingerprint": config.get("fp", "chrome"),
             "publicKey": config.get("pbk", ""),
             "shortId": config.get("sid", ""),
             "spiderX": config.get("spx", "")
         }
-    }
+    elif config["security"] in ["tls", "xtls"]:
+        stream_settings["tlsSettings"] = {
+            "serverName": config.get("sni", ""),
+            "fingerprint": config.get("fp", "chrome")
+        }
 
     return {
         "log": {"loglevel": "none"},
@@ -257,7 +286,8 @@ def process_subscription_content(content: str, source_url: str) -> List[Dict[str
     valid_configs = []
     for line in decoded_content.splitlines():
         line = line.strip()
-        if line.startswith("vless://") and "security=reality" in line:
+        # بهینه‌سازی فیلتر خطوط برای استخراج هر دو نوع پروتکل امنیتی TLS و Reality
+        if line.startswith("vless://") and any(term in line for term in ["security=reality", "security=tls", "security=xtls"]):
             parsed_data = parse_vless_config(line)
             if parsed_data:
                 identifier = (parsed_data["server"], parsed_data["port"], parsed_data["uuid"])
@@ -267,10 +297,9 @@ def process_subscription_content(content: str, source_url: str) -> List[Dict[str
     return valid_configs
 
 def gather_configurations(links: List[str]) -> List[Dict]:
-    safe_print("🚀 مرحله ۱/۳: در حال دریافت و پردازش کانفیگ‌های Reality...")
+    safe_print("🚀 مرحله ۱/۳: در حال دریافت و پردازش کانفیگ‌های Reality و TLS...")
     all_configs = []
     total_links = len(links)
-    # تنظیم ۳۰ ورکر برای دانلود سریع سورس‌ها بدون مسدود شدن آی‌پی گیت‌هاب
     with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
         futures = {executor.submit(fetch_subscription_content, url): url for url in links}
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
@@ -294,7 +323,6 @@ def measure_quality_metrics(config: Dict) -> Optional[Dict]:
     for _ in range(NUM_TCP_TESTS):
         lat = test_tcp_latency(host, port, TCP_CONNECT_TIMEOUT)
         if lat: latencies.append(lat)
-        # مکث بین پینگ‌ها در گیت‌هاب اکشنز بسیار مهم است تا کلادفلر آی‌پی را مسدود نکند
         time.sleep(0.1) 
         
     if not latencies or len(latencies) < (NUM_TCP_TESTS * MIN_SUCCESSFUL_TESTS_RATIO):
@@ -310,8 +338,6 @@ def evaluate_configs(configs: List[Dict]) -> List[Dict]:
     
     tcp_alive = []
     total_tcp = len(target_configs)
-    
-    # تنظیم ۱۵۰ ورکر برای تست TCP که برای پردازنده ۲ هسته‌ای گیت‌هاب ایده‌آل است
     workers = 150
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
@@ -330,8 +356,6 @@ def evaluate_configs(configs: List[Dict]) -> List[Dict]:
         
     safe_print(f"\n🛡️ مرحله ۳/۳: تست عمیق اعتبارسنجی با Xray روی {len(xray_targets)} سرور زنده لایه اول...")
     xray_verified = []
-    
-    # تنظیم ۴۰ ورکر برای هسته Xray. بیشتر از این مقدار باعث کرش کردن CPU گیت‌هاب اکشنز می‌شود
     xray_workers = 40
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=xray_workers) as executor:
@@ -383,7 +407,6 @@ def main():
         safe_print("❌ هسته Xray یافت نشد. لطفاً ابتدا فایل xray را در کنار اسکریپت قرار دهید.")
         sys.exit(1)
 
-    # دادن مجوز اجرا به باینری xray در لینوکس (مخصوص گیت‌هاب اکشنز)
     os.chmod(XRAY_PATH, 0o755)
 
     start = time.time()
